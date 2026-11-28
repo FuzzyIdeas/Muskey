@@ -1566,7 +1566,6 @@ final class ThreeFingerTap: @unchecked Sendable {
     private var runLoop: CFRunLoop?
     private var started: Date?
     private var moved = false
-    private var positions: [Int: CGPoint] = [:]
 
     init?() {
         // 29 is the gesture event, which isn't in CGEventType.
@@ -1616,37 +1615,50 @@ final class ThreeFingerTap: @unchecked Sendable {
 
     deinit { stop() }
 
-    /// The number of fingers in the last gesture event, for the log, which notes each change.
-    private var fingers = -1
+    /// The fingers on the trackpad, from their first touch to their lift, and the most of them during this touch.
+    /// Each gesture event carries only some of the touches, never all three fingers at once, so they are counted
+    /// across the events.
+    private var down: [Int: CGPoint] = [:]
+    private var most = 0
 
     /// On the main thread.
     private func read(_ event: NSEvent) {
-        let count = event.touches(matching: .touching, in: nil).count
-        if count != fingers {
-            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").debug("three-finger tap: \(count, privacy: .public) fingers on the trackpad")
-            fingers = count
+        // A lift that never came in an event would keep a finger down for good.
+        if let start = started, Date().timeIntervalSince(start) > 3 {
+            down = [:]
+            started = nil
+            most = 0
         }
         // Only trackpad touches have a position; a touch screen's would raise an exception.
-        let touches = event.touches(matching: .touching, in: nil).filter { $0.type == .indirect }
-        if touches.count == 3 {
-            if started == nil {
-                started = Date()
-                moved = false
-                positions = Dictionary(touches.map { ($0.identity.hash, $0.normalizedPosition) }, uniquingKeysWith: { a, _ in a })
-            } else if !moved {
-                moved = touches.contains { touch in
-                    positions[touch.identity.hash].map { hypot(touch.normalizedPosition.x - $0.x, touch.normalizedPosition.y - $0.y) > 0.06 } ?? false
+        for touch in event.touches(matching: .any, in: nil) where touch.type == .indirect {
+            let id = touch.identity.hash
+            switch touch.phase {
+            case .began, .moved, .stationary:
+                if let first = down[id] {
+                    if hypot(touch.normalizedPosition.x - first.x, touch.normalizedPosition.y - first.y) > 0.06 { moved = true }
+                } else {
+                    down[id] = touch.normalizedPosition
+                    if started == nil {
+                        started = Date()
+                        moved = false
+                    }
                 }
+            case .ended, .cancelled:
+                down[id] = nil
+            default:
+                break
             }
-            return
         }
-        guard let start = started else { return }
-        if touches.count < 3, !moved, Date().timeIntervalSince(start) < 0.4 {
+        most = max(most, down.count)
+        guard down.isEmpty, let start = started else { return }
+        let fingers = most, still = !moved, quick = Date().timeIntervalSince(start) < 0.4
+        Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").debug("three-finger tap: \(fingers, privacy: .public) fingers lifted\(still ? "" : ", moved", privacy: .public)\(quick ? "" : ", slow", privacy: .public)")
+        if fingers == 3, still, quick {
             Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").log("three-finger tap")
             onTap()
         }
         started = nil
         moved = false
-        positions = [:]
+        most = 0
     }
 }
