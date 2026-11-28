@@ -1574,8 +1574,10 @@ final class ThreeFingerTap: @unchecked Sendable {
                                           callback: { _, type, event, info in
                                               if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                                                   if let info { Unmanaged<ThreeFingerTap>.fromOpaque(info).takeUnretainedValue().enable() }
-                                              } else if type.rawValue == 29, let info, let ns = NSEvent(cgEvent: event) {
-                                                  Unmanaged<ThreeFingerTap>.fromOpaque(info).takeUnretainedValue().read(ns)
+                                              } else if type.rawValue == 29, let info, let copy = event.copy() {
+                                                  // AppKit gives an event its touches only on the main thread, as Pipiri reads them.
+                                                  let tap = Unmanaged<ThreeFingerTap>.fromOpaque(info).takeUnretainedValue()
+                                                  DispatchQueue.main.async { if let ns = NSEvent(cgEvent: copy) { tap.read(ns) } }
                                               }
                                               return Unmanaged.passUnretained(event)
                                           }, userInfo: me)
@@ -1608,7 +1610,7 @@ final class ThreeFingerTap: @unchecked Sendable {
 
     private var seen = 0
 
-    /// On the tap's thread.
+    /// On the main thread.
     private func read(_ event: NSEvent) {
         if seen < 3 {
             seen += 1
@@ -1629,9 +1631,7 @@ final class ThreeFingerTap: @unchecked Sendable {
             return
         }
         guard let start = started else { return }
-        if touches.count < 3, !moved, Date().timeIntervalSince(start) < 0.4 {
-            DispatchQueue.main.async { [weak self] in self?.onTap() }
-        }
+        if touches.count < 3, !moved, Date().timeIntervalSince(start) < 0.4 { onTap() }
         started = nil
         moved = false
         positions = [:]
