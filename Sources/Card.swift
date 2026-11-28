@@ -550,11 +550,12 @@ struct HUDCard: View {
                             VStack(spacing: 8) {
                                 RecordingStrip(analysis: recording, palette: palette, edit: model.onRecordingEdit)
                                     .frame(width: ring - 30, height: 16)
-                                SensitivityRow(sensitivity: recording.sensitivity, palette: palette, titled: false, sliderWidth: 46) { sensitivity in
+                                SensitivityRow(sensitivity: recording.sensitivity, palette: palette, compact: true) { sensitivity in
                                     var changed = recording
                                     changed.sensitivity = sensitivity
                                     model.onRecordingEdit(changed)
                                 }
+                                .frame(width: ring - 30)
                             }
                             .padding(.top, 4)
                             .transition(.opacity)

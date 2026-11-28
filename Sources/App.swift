@@ -230,6 +230,8 @@ final class HUDModel: ObservableObject {
     var onOpenLocation: () -> Void = {}
     /// The microphone records, and the HUD shows the recording in place of either layout.
     @Published var mic: MicState?
+    /// The level of the microphone while it records, which only the meter and the strip read.
+    let micMeter = MicMeter()
     /// Microphone in Nothing playing, and the microphone hotkey.
     var onMic: () -> Void = {}
     var onMicStop: () -> Void = {}
@@ -620,7 +622,7 @@ struct HUDView: View {
         Group {
             if let mic = model.mic {
                 // A recording from the microphone takes the whole HUD until it stops.
-                MicCard(mic: mic, palette: palette, stop: model.onMicStop, cancel: model.onMicCancel, edit: model.onMicEdit)
+                MicCard(mic: mic, meter: model.micMeter, palette: palette, stop: model.onMicStop, cancel: model.onMicCancel, edit: model.onMicEdit)
                     .transition(.opacity)
             } else if let saving = model.saving {
                 // A save takes the whole HUD until it ends, in a compact layout with the record, so nothing else
@@ -715,6 +717,12 @@ struct HUDView: View {
                     if focus, !model.karaokeKeys, case let .found(lyrics) = model.lyrics, let source = lyrics.source {
                         LyricsCredit(source: source, palette: palette, large: true)
                             .padding(.trailing, 4)
+                            .transition(.opacity)
+                    }
+                    // Starts a recording from the microphone, and shows that Muskey can record at all.
+                    if !focus {
+                        RoundButton(symbol: "record.circle", help: "Record from the microphone (\(model.micHotkey))", label: "Record", key: model.micHotkey,
+                                    palette: palette, action: model.onMic)
                             .transition(.opacity)
                     }
                     // Karaoke has a button too, besides Return and ⌘K, so that it can be found and clicked like the lyrics.
@@ -937,11 +945,12 @@ struct HUDView: View {
                 VStack(spacing: 8) {
                     RecordingStrip(analysis: recording, palette: palette, edit: model.onRecordingEdit)
                         .frame(width: Self.keyRowWidth - 14, height: 16)
-                    SensitivityRow(sensitivity: recording.sensitivity, palette: palette, titled: false) { sensitivity in
+                    SensitivityRow(sensitivity: recording.sensitivity, palette: palette) { sensitivity in
                         var changed = recording
                         changed.sensitivity = sensitivity
                         model.onRecordingEdit(changed)
                     }
+                    .frame(width: Self.keyRowWidth - 14)
                 }
                 .padding(.top, -4)
                 .transition(.opacity)
@@ -6846,8 +6855,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             let stems = StemsCache.sweep(olderThan: age, keeping: kept)
             let songs = LinkCache().sweep(olderThan: age, keeping: kept)
-            guard stems + songs > 0 else { return }
-            DispatchQueue.main.async { self?.log("cache cleanup: deleted \(stems) stems files and \(songs) downloaded songs") }
+            let recordings = RecordingStore.sweep(olderThan: age, keeping: kept)
+            guard stems + songs + recordings > 0 else { return }
+            DispatchQueue.main.async { self?.log("cache cleanup: deleted \(stems) stems files, \(songs) downloaded songs and \(recordings) recordings") }
         }
     }
 
@@ -9123,6 +9133,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 refreshStatus()
             }
         }
+        recorder.onLevel = { [weak self] level, seconds in
+            guard let self, micRecorder === recorder else { return }
+            model.micMeter.take(level: level, seconds: seconds)
+        }
         recorder.onKey = { [weak self] result, peak in
             guard let self, micRecorder === recorder, peak >= 0.0005, let key = DetectedKey(result) else { return }
             model.mic?.key = key
@@ -9209,6 +9223,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard path != recordingPath else { return }
         recordingPath = path
         model.recording = path.flatMap(RecordingStore.analysis(forSong:))
+        recordingSkip?.invalidate()
+        recordingSkip = nil
+        guard model.recording != nil else { return }
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in self?.skipOutsideMusic() }
+        RunLoop.main.add(timer, forMode: .common)
+        recordingSkip = timer
+    }
+
+    private var recordingSkip: Timer?
+
+    /// A recording plays only its highlighted parts: from a part that isn't used for the key, the song moves to the
+    /// next one that is, and after the last one it stops at the start of the first.
+    private func skipOutsideMusic() {
+        guard let recording = model.recording, playsInFilePlayer, let track = nowPlaying.track, track.playing, model.seekable,
+              let now = track.position(at: Date()) else { return }
+        let regions = recording.regions()
+        guard let first = regions.first, !regions.contains(where: { $0.lowerBound - 0.05 <= now && now < $0.upperBound }) else { return }
+        // A seek that the player hasn't reported yet.
+        if let target = seekTarget, Date().timeIntervalSince(target.at) < 1 { return }
+        seekTarget = (track.song, (regions.first { $0.lowerBound > now } ?? first).lowerBound, Date())
+        if let next = regions.first(where: { $0.lowerBound > now }) {
+            log(String(format: "recording: skipping to the music at %.1f s", next.lowerBound))
+            moveSong(track, to: next.lowerBound)
+        } else {
+            log("recording: the last part of music ended, back to the first")
+            nowPlaying.play(false)
+            moveSong(track, to: first.lowerBound)
+        }
     }
 
     /// A part of the recording that plays was added to the key or left out, or a sensitivity changed: the key is read
@@ -9798,6 +9840,7 @@ extension EnvironmentValues {
                            hotkey: Shortcut.mic.symbols, device: "MacBook Pro Microphone", tried: variant == "-mic-fallback" ? "Studio Display Microphone" : nil)
                 : nil
             model.recording = variant == "-mic-recording" ? RecordingAnalysis.sample() : nil
+            if variant.hasPrefix("-mic") { model.micMeter.take(level: -16, seconds: 54.1) }
             model.saving = variant == "-saving" ? SavingState(name: "Paper Lanterns (C minor, 90%)", progress: 0.42, left: nil)
                 : variant == "-recording" ? SavingState(name: "Paper Lanterns (no vocals)", progress: nil, left: "2:15 left") : nil
             // The arm on the record, or lifted off it with the pause glyph that Space shows.

@@ -252,6 +252,27 @@ enum RecordingStore {
         return regions.reduce(0) { $0 + $1.upperBound - $1.lowerBound } >= 3 ? regions : nil
     }
 
+    /// The cache cleanup: recordings that weren't recorded, edited or played for `age` seconds, kept until then even
+    /// when they were never saved elsewhere. Raw samples that a crash left wait for the next launch to recover them.
+    static func sweep(olderThan age: TimeInterval, keeping kept: Set<String>) -> Int {
+        let manager = FileManager.default
+        guard let names = try? manager.contentsOfDirectory(atPath: folder.path) else { return 0 }
+        let limit = Date().addingTimeInterval(-age)
+        var deleted = 0
+        for name in names where name.hasSuffix(".m4a") {
+            let song = folder.appending(path: name), base = String(name.dropLast(4))
+            guard !kept.contains(song.path), !manager.fileExists(atPath: samples(base).path) else { continue }
+            let dates = [song, analysisFile(base)].compactMap {
+                try? $0.resourceValues(forKeys: [.contentModificationDateKey, .contentAccessDateKey])
+            }.flatMap { [$0.contentModificationDate, $0.contentAccessDate].compactMap(\.self) }
+            guard let last = dates.max(), last < limit else { continue }
+            try? manager.removeItem(at: song)
+            try? manager.removeItem(at: analysisFile(base))
+            deleted += 1
+        }
+        return deleted
+    }
+
     /// Turns the raw samples of `base` into an Apple Lossless song file and deletes them once the song file reads back
     /// whole. Nil, with the samples kept, when anything fails.
     static func finish(_ base: String, rate: Double) -> URL? {
@@ -372,6 +393,8 @@ final class MicRecorder: @unchecked Sendable {
     /// On the main queue, about ten times a second.
     var onUpdate: (RecordingAnalysis, Double) -> Void = { _, _ in }
     var onKey: (EKResult, Float) -> Void = { _, _ in }
+    /// The level of each buffer of samples in dBFS, and the seconds recorded, on the main queue.
+    var onLevel: (Float, Double) -> Void = { _, _ in }
 
     init(sensitivity: RecordingSensitivity) {
         base = RecordingStore.newBase()
@@ -448,7 +471,7 @@ final class MicRecorder: @unchecked Sendable {
             playIn(testFile)
         } else {
             let input = engine.inputNode
-            input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+            input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
                 guard let self, let mixed = Self.mono(buffer) else { return }
                 queue.async { self.take(mixed) }
             }
@@ -463,7 +486,7 @@ final class MicRecorder: @unchecked Sendable {
                 input.removeTap(onBus: 0)
                 let format = input.outputFormat(forBus: 0)
                 guard format.sampleRate == rate else { throw error }
-                input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
+                input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
                     guard let self, let mixed = Self.mono(buffer) else { return }
                     queue.async { self.take(mixed) }
                 }
@@ -485,12 +508,12 @@ final class MicRecorder: @unchecked Sendable {
         var errorDescription: String? { "no microphone input" }
     }
 
-    /// Plays a file in as if it came from the microphone, a tenth of a second at a time.
+    /// Plays a file in as if it came from the microphone, 25 ms at a time.
     private func playIn(_ file: AVAudioFile) {
-        let chunk = AVAudioFrameCount(file.processingFormat.sampleRate / 10)
+        let chunk = AVAudioFrameCount(file.processingFormat.sampleRate / 40)
         guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: chunk) else { return }
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: 0.1)
+        timer.schedule(deadline: .now(), repeating: 0.025)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             guard (try? file.read(into: buffer, frameCount: chunk)) != nil, buffer.frameLength > 0, let mixed = Self.mono(buffer) else {
@@ -518,6 +541,11 @@ final class MicRecorder: @unchecked Sendable {
     private func take(_ samples: [Float]) {
         guard !stopped, let handle else { return }
         samples.withUnsafeBytes { handle.write(Data($0)) }
+        var squares: Float = 0
+        vDSP_svesq(samples, 1, &squares, vDSP_Length(samples.count))
+        let level = RecordingAnalysis.level(squares, count: samples.count)
+        let seconds = Double(frames + AVAudioFramePosition(samples.count)) / rate
+        DispatchQueue.main.async { [weak self] in self?.onLevel(level, seconds) }
         let cellFrames = Int(rate * RecordingAnalysis.cell)
         for sample in samples {
             cellSquares += sample * sample
