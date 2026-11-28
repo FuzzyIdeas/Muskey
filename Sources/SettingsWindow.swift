@@ -738,6 +738,9 @@ private struct MiniPlayerPane: View {
 /// The three-finger tap reads the trackpad through an event tap that sees every finger only with Accessibility
 /// allowed. Until it is, a red pill says so beside Allow, which asks for it and opens its pane in System Settings.
 private struct AccessibilityRow: View {
+    /// What macOS calls the Accessibility permission in System Settings: macOS 27 renamed it.
+    static let permissionName = if #available(macOS 27, *) { "Device Control and Data Access" } else { "Accessibility" }
+
     @State private var allowed = AXIsProcessTrusted()
     @Environment(\.colorScheme) private var scheme
     private let check = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -754,7 +757,7 @@ private struct AccessibilityRow: View {
                     }
                 }
             } label: {
-                Text("Accessibility needed")
+                Text("\(Self.permissionName) permission needed")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(StripColors.text(.red, scheme))
                     .padding(.horizontal, 8)
