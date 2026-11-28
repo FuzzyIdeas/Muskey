@@ -75,12 +75,15 @@ extension SoundKind {
         }
     }
 
+    /// Honey for music, lime green for speech, red for noise and a calm blue for silence, on the bars, the line under
+    /// the waveform and the waveform itself.
     func color(_ palette: Palette, _ scheme: ColorScheme) -> Color {
-        switch self {
+        let dark = scheme == .dark
+        return switch self {
         case .music: StripColors.solid(.honey, scheme).fill
-        case .speech: StripColors.solid(.blue, scheme).fill
-        case .noise: palette.ink.opacity(0.38)
-        case .silence: palette.ink.opacity(0.16)
+        case .speech: dark ? Color(red: 0.62, green: 0.88, blue: 0.3) : Color(red: 0.45, green: 0.72, blue: 0.12)
+        case .noise: dark ? Color(red: 1.0, green: 0.42, blue: 0.38) : Color(red: 0.9, green: 0.27, blue: 0.24)
+        case .silence: dark ? Color(red: 0.5, green: 0.7, blue: 0.95) : Color(red: 0.35, green: 0.56, blue: 0.82)
         }
     }
 }
@@ -101,7 +104,7 @@ struct MicCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 14) {
-                MicOrb(level: mic.level, music: mic.current == .music)
+                MicOrb(meter: meter, music: mic.current == .music)
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text("Recording")
@@ -215,23 +218,25 @@ struct MicCard: View {
 
 /// A red orb that glows brighter with the level, and fuller while music plays.
 private struct MicOrb: View {
-    let level: Double
+    @ObservedObject var meter: MicMeter
     let music: Bool
+    /// The level from 0 to 1, as fast as the meter, which makes the halo pulse like the halos of the instruments.
+    private var level: Double { Double(min(1, max(0, (meter.level + 50) / 50))) }
     private static let red = Color(red: 0.93, green: 0.26, blue: 0.24)
 
     var body: some View {
         ZStack {
             Circle()
                 .fill(RadialGradient(colors: [Self.red.opacity(0.55), Self.red.opacity(0)], center: .center, startRadius: 8, endRadius: 30))
-                .scaleEffect(1 + level * 0.35)
-                .opacity(0.35 + level * 0.65)
+                .scaleEffect(1 + level * (music ? 0.6 : 0.3))
+                .opacity(music ? 0.45 + level * 0.55 : 0.3 + level * 0.4)
             Circle()
                 .fill(RadialGradient(colors: [Color(red: 1, green: 0.55, blue: 0.5), Self.red], center: UnitPoint(x: 0.38, y: 0.32), startRadius: 1, endRadius: 16))
                 .frame(width: 26, height: 26)
                 .shadow(color: Self.red.opacity(music ? 0.7 : 0.35), radius: 6 + level * 8)
         }
         .frame(width: 52, height: 52)
-        .animation(.easeOut(duration: 0.12), value: level)
+        .animation(.easeOut(duration: 0.08), value: level)
         .animation(.easeOut(duration: 0.3), value: music)
         .accessibilityLabel("Recording")
     }
@@ -312,6 +317,21 @@ struct RecordingStrip: View {
                         context.fill(Path(rect), with: .color(segment.kind.color(palette, scheme)))
                     }
                 }
+                // What a click would change: a part used for the key, outlined in red for leaving it out, or a run of
+                // one kind outlined in honey for adding it. A pointer on an edge shows the edge that a drag moves.
+                if dragged == nil, let hovered {
+                    if let edge = edge(at: x(hovered), width: size.width, span: span) {
+                        let at = x(edge.start ? edge.region.lowerBound : edge.region.upperBound)
+                        context.fill(Path(roundedRect: CGRect(x: at - 2.5, y: 0, width: 5, height: size.height), cornerRadius: 2.5), with: .color(honey))
+                    } else if let target = target(at: hovered) {
+                        let rect = CGRect(x: x(target.range.lowerBound), y: 0.75, width: max(3, x(target.range.upperBound) - x(target.range.lowerBound)),
+                                          height: size.height - 1.5)
+                        let color = target.adds ? honey : SoundKind.noise.color(palette, scheme)
+                        context.fill(Path(roundedRect: rect, cornerRadius: 4), with: .color(color.opacity(0.16)))
+                        context.stroke(Path(roundedRect: rect, cornerRadius: 4), with: .color(color),
+                                       style: StrokeStyle(lineWidth: 1.5, dash: target.adds ? [] : [3, 2]))
+                    }
+                }
                 // An edge at each end of the parts used for the key.
                 for region in regions {
                     for edge in [region.lowerBound, region.upperBound] {
@@ -345,6 +365,7 @@ struct RecordingStrip: View {
             .onContinuousHover { phase in
                 if case let .active(point) = phase { hovered = Double(point.x / max(width, 1)) * span } else { hovered = nil }
             }
+            .pointerStyle(hovered.flatMap { edge(at: CGFloat($0 / span) * width, width: width, span: span) } != nil ? .columnResize : .link)
             .help(hovered.map { time in analysis.regions().contains { $0.contains(time) } }.map {
                 $0 ? "Leave this part out of the key (click), move its edges (drag)" : "Use this part for the key (click)"
             } ?? "")
@@ -360,6 +381,14 @@ struct RecordingStrip: View {
                 : region.lowerBound ... max(dragged.to, region.lowerBound + RecordingAnalysis.cell)
         }
         return regions
+    }
+
+    /// What a click at `time` changes, as `toggle(at:)` does: a part used for the key is left out, and any other run
+    /// of one kind is added.
+    private func target(at time: Double) -> (range: ClosedRange<Double>, adds: Bool)? {
+        if let region = analysis.regions().first(where: { $0.contains(time) }) { return (region, false) }
+        guard let segment = analysis.segments().first(where: { $0.start <= time && time < $0.end }) else { return nil }
+        return (segment.start ... segment.end, true)
     }
 
     private func edge(at x: CGFloat, width: CGFloat, span: Double) -> (region: ClosedRange<Double>, start: Bool)? {
@@ -394,7 +423,8 @@ struct SensitivityRow: View {
     }
 
     private func bar(_ kind: SoundKind, _ path: WritableKeyPath<RecordingSensitivity, Double>) -> some View {
-        SensitivityBar(kind: kind, value: sensitivity[keyPath: path], lit: current == kind, mark: marks[kind], compact: compact, palette: palette) { value in
+        SensitivityBar(kind: kind, value: sensitivity[keyPath: path], lit: current == kind, mark: marks[kind], compact: compact, dimmed: current == .music,
+                       palette: palette) { value in
             var changed = sensitivity
             changed[keyPath: path] = value
             set(changed)
@@ -408,6 +438,8 @@ private struct SensitivityBar: View {
     let lit: Bool
     let mark: Double?
     var compact = false
+    /// Music plays, which no bar is about.
+    var dimmed = false
     let palette: Palette
     let set: (Double) -> Void
     @Environment(\.colorScheme) private var scheme
@@ -422,12 +454,7 @@ private struct SensitivityBar: View {
         }
     }
 
-    private var tint: Color {
-        switch kind {
-        case .speech: StripColors.solid(.blue, scheme).fill
-        default: palette.ink
-        }
-    }
+    private var tint: Color { kind.color(palette, scheme) }
 
     var body: some View {
         HStack(spacing: 7) {
@@ -447,11 +474,11 @@ private struct SensitivityBar: View {
                 ZStack(alignment: .leading) {
                     Capsule().fill(palette.ink.opacity(0.1)).frame(height: 5)
                     // Filled up to the value: the share of sounds that the bar takes as its kind.
-                    Capsule().fill(tint.opacity(kind == .speech ? 0.85 : 0.55)).frame(width: max(5, width * value), height: 5)
+                    Capsule().fill(tint.opacity(0.85)).frame(width: max(5, width * value), height: 5)
                     // Where the sound heard now sits: filling past it takes the sound as this kind.
                     if let mark {
                         RoundedRectangle(cornerRadius: 1)
-                            .fill(StripColors.solid(.red, scheme).fill)
+                            .fill(palette.ink.opacity(0.85))
                             .frame(width: 2, height: 14)
                             .offset(x: min(width - 2, max(0, width * mark - 1)))
                             .animation(.easeOut(duration: 0.25), value: mark)
@@ -471,10 +498,14 @@ private struct SensitivityBar: View {
         .padding(.leading, 9)
         .padding(.trailing, 7)
         .frame(height: 24)
-        .background(Capsule().fill(lit ? tint.opacity(kind == .speech ? 0.22 : 0.14) : palette.ink.opacity(0.05)))
-        .overlay(Capsule().strokeBorder(tint.opacity(lit ? 0.5 : 0), lineWidth: 1))
+        .background(Capsule().fill(lit ? tint.opacity(0.24) : palette.ink.opacity(0.05)))
+        .overlay(Capsule().strokeBorder(tint.opacity(lit ? 0.9 : 0), lineWidth: 1.5))
+        // Lit in its colour while the sound heard now is its kind, so the kind reads from across the room.
+        .shadow(color: tint.opacity(lit ? 0.75 : 0), radius: lit ? 9 : 0)
+        .opacity(dimmed ? 0.4 : 1)
         .onHover { hovering = $0 }
         .animation(.easeOut(duration: 0.2), value: lit)
+        .animation(.easeOut(duration: 0.3), value: dimmed)
         .animation(.easeOut(duration: 0.12), value: hovering)
         .help(help)
         .accessibilityElement()
@@ -531,6 +562,39 @@ private struct LiveStrip<Content: View>: View {
     @ViewBuilder let content: ((seconds: Double, level: Float)) -> Content
 
     var body: some View { content((meter.seconds, meter.level)) }
+}
+
+/// The parts of a recording over its waveform, in the colours of the line under it: speech, noise and silence tinted
+/// in theirs, and the parts used for the key in honey with an edge at each end. Clicks go through to the waveform,
+/// which plays from there without adding anything.
+struct RecordingRegionsOverlay: View {
+    let analysis: RecordingAnalysis
+    let palette: Palette
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        Canvas { context, size in
+            let span = max(analysis.duration, RecordingAnalysis.cell)
+            let x = { (time: Double) in CGFloat(time / span) * size.width }
+            let keep = analysis.included()
+            for segment in analysis.segments() where segment.kind != .music {
+                // Only the parts left out of the key: a part that was added back is honey, under the regions below.
+                let first = Int(segment.start / RecordingAnalysis.cell)
+                guard first < keep.count, !keep[first] else { continue }
+                let rect = CGRect(x: x(segment.start), y: 0, width: max(1, x(segment.end) - x(segment.start)), height: size.height)
+                context.fill(Path(rect), with: .color(segment.kind.color(palette, scheme).opacity(0.14)))
+            }
+            let honey = StripColors.solid(.honey, scheme).fill
+            for region in analysis.regions() {
+                let rect = CGRect(x: x(region.lowerBound), y: 0, width: max(2, x(region.upperBound) - x(region.lowerBound)), height: size.height)
+                context.fill(Path(roundedRect: rect, cornerRadius: 4), with: .color(honey.opacity(0.12)))
+                for edge in [region.lowerBound, region.upperBound] {
+                    context.fill(Path(roundedRect: CGRect(x: x(edge) - 1, y: 0, width: 2, height: size.height), cornerRadius: 1), with: .color(honey.opacity(0.9)))
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
 }
 
 extension RecordingAnalysis {

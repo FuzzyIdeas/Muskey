@@ -545,6 +545,12 @@ struct HUDCard: View {
                         CardWaveform(wave: model.wave, track: track, width: ring - 30, ticking: model.shown && model.playing,
                                      bpm: model.shownTempo?.bpm, muted: model.stemsMuted, loop: model.loop, setLoop: model.onLoopSet,
                                      typing: model.onLoopTyping, palette: palette)
+                            .overlay(alignment: .bottom) {
+                                if let recording = model.recording, model.wave.zoom <= 1, !model.wave.lanes, model.wave.waveform != nil {
+                                    RecordingRegionsOverlay(analysis: recording, palette: palette)
+                                        .frame(width: ring - 30, height: 30)
+                                }
+                            }
                         // A recording from the microphone: its parts along the waveform, and how readily each kind is heard.
                         if let recording = model.recording {
                             VStack(spacing: 8) {

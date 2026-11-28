@@ -938,6 +938,13 @@ struct HUDView: View {
             }
             if showsWaveform(.ribbon) {
                 waveform(palette, width: Self.keyRowWidth - 14, height: 40)
+                    // The parts of a recording, in the colours of the line under the waveform, while the whole song shows.
+                    .overlay(alignment: .top) {
+                        if let recording = model.recording, model.wave.zoom <= 1, !model.wave.lanes {
+                            RecordingRegionsOverlay(analysis: recording, palette: palette)
+                                .frame(width: Self.keyRowWidth - 14, height: 40)
+                        }
+                    }
                     .transition(.opacity)
             }
             // A recording from the microphone: its parts along the waveform, and how readily each kind is heard.
@@ -9232,25 +9239,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var recordingSkip: Timer?
+    /// Where the song was at the last check, to tell a jump that a click or a key made from the song playing on.
+    private var lastSkipCheck: (position: Double, at: Date)?
+    /// A part that isn't music, which a click on the waveform or a seek moved the song into: it plays to its end.
+    private var auditioning: ClosedRange<Double>?
+    /// Muskey's own move, which isn't a jump of the person's.
+    private var skipMoveAt = Date.distantPast
 
-    /// A recording plays only its highlighted parts: from a part that isn't used for the key, the song moves to the
-    /// next one that is, and after the last one it stops at the start of the first.
+    /// A recording plays its highlighted parts in a loop: from a part that isn't used for the key, the song moves to
+    /// the next one that is, and after the last one back to the first. A loop of the whole song does the same, and a
+    /// region loop skips the parts in it that aren't music. A part that the person moved the song into plays.
     private func skipOutsideMusic() {
         guard let recording = model.recording, playsInFilePlayer, let track = nowPlaying.track, track.playing, model.seekable,
-              let now = track.position(at: Date()) else { return }
+              let now = track.position(at: Date()) else { return lastSkipCheck = nil }
+        let last = lastSkipCheck
+        lastSkipCheck = (now, Date())
         let regions = recording.regions()
-        guard let first = regions.first, !regions.contains(where: { $0.lowerBound - 0.05 <= now && now < $0.upperBound }) else { return }
+        guard let first = regions.first else { return }
+        // Music that runs to the end of the file goes back a little before it, before the player stops or moves on.
+        let ending = regions.last.map { $0.upperBound >= (track.duration ?? .infinity) - 0.3 && now >= $0.upperBound - 0.25 } ?? false
+        let inside = !ending && regions.contains { $0.lowerBound - 0.05 <= now && now < $0.upperBound }
+        if inside { return auditioning = nil }
+        // A jump that Muskey didn't make: the person moved the song into this part to hear it.
+        if let last, Date().timeIntervalSince(skipMoveAt) > 1.5, abs(now - (last.position + Date().timeIntervalSince(last.at))) > 0.6 {
+            auditioning = recording.leftOut(at: now)
+            if let auditioning { log(String(format: "recording: playing the part from %.1f to %.1f s that isn't used for the key", auditioning.lowerBound, auditioning.upperBound)) }
+        }
+        if let auditioning, auditioning.lowerBound - 0.1 <= now, now < auditioning.upperBound { return }
+        auditioning = nil
         // A seek that the player hasn't reported yet.
         if let target = seekTarget, Date().timeIntervalSince(target.at) < 1 { return }
-        seekTarget = (track.song, (regions.first { $0.lowerBound > now } ?? first).lowerBound, Date())
-        if let next = regions.first(where: { $0.lowerBound > now }) {
-            log(String(format: "recording: skipping to the music at %.1f s", next.lowerBound))
-            moveSong(track, to: next.lowerBound)
-        } else {
-            log("recording: the last part of music ended, back to the first")
-            nowPlaying.play(false)
-            moveSong(track, to: first.lowerBound)
-        }
+        let next = regions.first { $0.lowerBound > now } ?? first
+        seekTarget = (track.song, next.lowerBound, Date())
+        skipMoveAt = Date()
+        log(String(format: "recording: %@ the music at %.1f s", next == first && now > first.upperBound ? "back to" : "skipping to", next.lowerBound))
+        moveSong(track, to: next.lowerBound)
     }
 
     /// A part of the recording that plays was added to the key or left out, or a sensitivity changed: the key is read

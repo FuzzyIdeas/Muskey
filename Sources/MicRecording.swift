@@ -115,6 +115,17 @@ struct RecordingAnalysis: Codable, Equatable {
         return keep
     }
 
+    /// The run of cells left out of the key around `time`, nil when that cell is used for the key.
+    func leftOut(at time: Double) -> ClosedRange<Double>? {
+        let keep = included()
+        let i = Int(time / Self.cell)
+        guard keep.indices.contains(i), !keep[i] else { return nil }
+        var from = i, to = i + 1
+        while from > 0, !keep[from - 1] { from -= 1 }
+        while to < keep.count, !keep[to] { to += 1 }
+        return Double(from) * Self.cell ... Double(to) * Self.cell
+    }
+
     /// The parts used for the key, in seconds.
     func regions() -> [ClosedRange<Double>] {
         runs(of: included()).filter(\.value).map { Double($0.start) * Self.cell ... Double($0.end) * Self.cell }
