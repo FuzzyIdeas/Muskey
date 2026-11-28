@@ -1216,21 +1216,14 @@ final class MiniPlayerPanel: NSPanel {
     /// A three-finger tap fades the player while the pointer is over it, and brings it back.
     private var threeFingerTap: ThreeFingerTap?
 
-    /// Whether the tap was made with Accessibility allowed. Only then may it filter at the head of the session, which
-    /// is where a gesture event carries every finger; a tap that only listens saw at most two of three. A tap made
-    /// before the permission was given stays a listening one, so it is made again.
-    private var tapHasAccess = false
-
     private func watchThreeFingerTap() {
         let wanted = isVisible && Preferences.shared.miniThreeFingerTap
-        let access = AXIsProcessTrusted()
-        guard wanted != (threeFingerTap != nil) || (wanted && access != tapHasAccess) else { return }
+        guard wanted != (threeFingerTap != nil) else { return }
         threeFingerTap?.stop()
         threeFingerTap = nil
         if wanted {
             threeFingerTap = ThreeFingerTap()
-            tapHasAccess = access
-            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").log("three-finger tap \(self.threeFingerTap.map { "watched, \($0.kind)" } ?? "not allowed by macOS", privacy: .public), Accessibility \(access ? "allowed" : "not allowed", privacy: .public)")
+            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").log("three-finger tap \(self.threeFingerTap.map { "watched on \($0.kind)" } ?? "unavailable, no trackpad or no MultitouchSupport", privacy: .public)")
             threeFingerTap?.onTap = { [weak self] in
                 guard let self, isVisible, frame.contains(NSEvent.mouseLocation) else { return }
                 setFaded(!faded)
@@ -1238,7 +1231,7 @@ final class MiniPlayerPanel: NSPanel {
         }
     }
 
-    /// Settings changed the three-finger tap, or Accessibility was allowed.
+    /// Settings changed the three-finger tap.
     func syncGestures() { watchThreeFingerTap() }
 
     func setFaded(_ on: Bool) {
@@ -1553,113 +1546,85 @@ struct RecordLinesFit {
     }
 }
 
-/// A tap of three fingers on the trackpad, read from the session's gesture events: touches never reach the mini
-/// player's non-activating panel, and they don't reach it at all while it is faded. The tap only listens, so it
-/// holds back no event, and it calls `onTap` on the main queue when three fingers touch and lift within 0.4 s without
-/// moving. Nil when macOS doesn't allow the tap.
+/// A tap of three fingers on the trackpad, read from the trackpad's touch frames through the private MultitouchSupport
+/// framework, as trackpad tools like MiddleClick read them. Each frame holds every finger on the trackpad, which no
+/// event tap does: the gesture events gave at most two fingers of three, with or without Accessibility. A tap is
+/// three fingers down and every finger lifted within 0.3 s, and `onTap` gets it on the main queue. Nil when the
+/// framework or a trackpad isn't there.
 final class ThreeFingerTap: @unchecked Sendable {
     var onTap: () -> Void = {}
-    /// Filtering at the head of the session, like Pipiri's, or only listening, for the log.
+    /// The trackpads, for the log.
     private(set) var kind = ""
-    private var tap: CFMachPort?
-    private var source: CFRunLoopSource?
-    private var thread: Thread?
-    private var runLoop: CFRunLoop?
-    private var started: Date?
-    private var moved = false
+
+    private typealias Callback = @convention(c) (Int32, UnsafeMutableRawPointer?, Int32, Double, Int32) -> Int32
+    private typealias CreateList = @convention(c) () -> Unmanaged<CFArray>?
+    private typealias Register = @convention(c) (UnsafeMutableRawPointer, Callback) -> Void
+    private typealias Start = @convention(c) (UnsafeMutableRawPointer, Int32) -> Void
+    private typealias Stop = @convention(c) (UnsafeMutableRawPointer) -> Void
+
+    private var devices: [UnsafeMutableRawPointer] = []
+    private var unregister: Register?
+    private var stopDevice: Stop?
+
+    /// The one tap that the C callback, which can't capture anything, hands its frames to.
+    private nonisolated(unsafe) static weak var current: ThreeFingerTap?
+    private let lock = NSLock()
+    private var started: Double?
+    private var most: Int32 = 0
 
     init?() {
-        // 29 is the gesture event, which isn't in CGEventType.
-        let mask: CGEventMask = 1 << 29
-        let me = Unmanaged.passUnretained(self).toOpaque()
-        // At the head of the session, as Pipiri's tap is, which gets the touches of a gesture; it only listens when
-        // macOS refuses a tap there.
-        let callback: CGEventTapCallBack = { _, type, event, info in
-                                              if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                                                  if let info { Unmanaged<ThreeFingerTap>.fromOpaque(info).takeUnretainedValue().enable() }
-                                              } else if type.rawValue == 29, let info, let copy = event.copy() {
-                                                  // AppKit gives an event its touches only on the main thread, as Pipiri reads them.
-                                                  let tap = Unmanaged<ThreeFingerTap>.fromOpaque(info).takeUnretainedValue()
-                                                  DispatchQueue.main.async { if let ns = NSEvent(cgEvent: copy) { tap.read(ns) } }
-                                              }
-                                              return Unmanaged.passUnretained(event)
-                                          }
-        let filtering = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: mask,
-                                          callback: callback, userInfo: me)
-        guard let tap = filtering ?? CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
-                                                       eventsOfInterest: mask, callback: callback, userInfo: me)
+        guard let framework = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport", RTLD_LAZY),
+              let createList = dlsym(framework, "MTDeviceCreateList").map({ unsafeBitCast($0, to: CreateList.self) }),
+              let register = dlsym(framework, "MTRegisterContactFrameCallback").map({ unsafeBitCast($0, to: Register.self) }),
+              let start = dlsym(framework, "MTDeviceStart").map({ unsafeBitCast($0, to: Start.self) }),
+              let list = createList()?.takeRetainedValue() as? [AnyObject], !list.isEmpty
         else { return nil }
-        kind = filtering == nil ? "listening" : "filtering"
-        self.tap = tap
-        source = CFMachPortCreateRunLoopSource(nil, tap, 0)
-        let thread = Thread { [weak self] in
-            guard let self, let source else { return }
-            runLoop = CFRunLoopGetCurrent()
-            CFRunLoopAddSource(runLoop, source, .commonModes)
-            CGEvent.tapEnable(tap: tap, enable: true)
-            CFRunLoopRun()
+        unregister = dlsym(framework, "MTUnregisterContactFrameCallback").map { unsafeBitCast($0, to: Register.self) }
+        stopDevice = dlsym(framework, "MTDeviceStop").map { unsafeBitCast($0, to: Stop.self) }
+        Self.current = self
+        for device in list {
+            let pointer = Unmanaged.passUnretained(device).toOpaque()
+            register(pointer, Self.frame)
+            start(pointer, 0)
+            devices.append(pointer)
         }
-        thread.name = "muskey.three-finger-tap"
-        thread.start()
-        self.thread = thread
+        kind = "\(devices.count) trackpad\(devices.count == 1 ? "" : "s")"
     }
 
-    private func enable() {
-        if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+    /// Called by MultitouchSupport on its own thread for each frame of each trackpad.
+    private static let frame: Callback = { _, _, fingers, timestamp, _ in
+        current?.read(fingers: fingers, at: timestamp)
+        return 0
+    }
+
+    private func read(fingers: Int32, at time: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        if fingers > 0 {
+            if started == nil { started = time }
+            most = max(most, fingers)
+            return
+        }
+        guard let start = started else { return }
+        let count = most, quick = time - start < 0.3
+        started = nil
+        most = 0
+        DispatchQueue.main.async { [weak self] in
+            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").debug("three-finger tap: \(count, privacy: .public) fingers lifted\(quick ? "" : ", slow", privacy: .public)")
+            guard count == 3, quick else { return }
+            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").log("three-finger tap")
+            self?.onTap()
+        }
     }
 
     func stop() {
-        if let tap { CGEvent.tapEnable(tap: tap, enable: false); CFMachPortInvalidate(tap) }
-        if let runLoop { CFRunLoopStop(runLoop) }
-        tap = nil
+        for device in devices {
+            unregister?(device, Self.frame)
+            stopDevice?(device)
+        }
+        devices = []
+        if Self.current === self { Self.current = nil }
     }
 
     deinit { stop() }
-
-    /// The fingers on the trackpad, from their first touch to their lift, and the most of them during this touch.
-    /// Each gesture event carries only some of the touches, never all three fingers at once, so they are counted
-    /// across the events.
-    private var down: [Int: CGPoint] = [:]
-    private var most = 0
-
-    /// On the main thread.
-    private func read(_ event: NSEvent) {
-        // A lift that never came in an event would keep a finger down for good.
-        if let start = started, Date().timeIntervalSince(start) > 3 {
-            down = [:]
-            started = nil
-            most = 0
-        }
-        // Only trackpad touches have a position; a touch screen's would raise an exception.
-        for touch in event.touches(matching: .any, in: nil) where touch.type == .indirect {
-            let id = touch.identity.hash
-            switch touch.phase {
-            case .began, .moved, .stationary:
-                if let first = down[id] {
-                    if hypot(touch.normalizedPosition.x - first.x, touch.normalizedPosition.y - first.y) > 0.06 { moved = true }
-                } else {
-                    down[id] = touch.normalizedPosition
-                    if started == nil {
-                        started = Date()
-                        moved = false
-                    }
-                }
-            case .ended, .cancelled:
-                down[id] = nil
-            default:
-                break
-            }
-        }
-        most = max(most, down.count)
-        guard down.isEmpty, let start = started else { return }
-        let fingers = most, still = !moved, quick = Date().timeIntervalSince(start) < 0.4
-        Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").debug("three-finger tap: \(fingers, privacy: .public) fingers lifted\(still ? "" : ", moved", privacy: .public)\(quick ? "" : ", slow", privacy: .public)")
-        if fingers == 3, still, quick {
-            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").log("three-finger tap")
-            onTap()
-        }
-        started = nil
-        moved = false
-        most = 0
-    }
 }
