@@ -1229,7 +1229,7 @@ final class MiniPlayerPanel: NSPanel {
         if wanted {
             threeFingerTap = ThreeFingerTap()
             tapHasAccess = access
-            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").log("three-finger tap \(self.threeFingerTap == nil ? "not allowed by macOS" : "watched", privacy: .public), Input Monitoring \(access ? "allowed" : "not allowed", privacy: .public)")
+            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").log("three-finger tap \(self.threeFingerTap.map { "watched, \($0.kind)" } ?? "not allowed by macOS", privacy: .public), Input Monitoring \(access ? "allowed" : "not allowed", privacy: .public)")
             threeFingerTap?.onTap = { [weak self] in
                 guard let self, isVisible, frame.contains(NSEvent.mouseLocation) else { return }
                 setFaded(!faded)
@@ -1558,6 +1558,8 @@ struct RecordLinesFit {
 /// moving. Nil when macOS doesn't allow the tap.
 final class ThreeFingerTap: @unchecked Sendable {
     var onTap: () -> Void = {}
+    /// Filtering at the head of the session, like Pipiri's, or only listening, for the log.
+    private(set) var kind = ""
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
     private var thread: Thread?
@@ -1570,8 +1572,9 @@ final class ThreeFingerTap: @unchecked Sendable {
         // 29 is the gesture event, which isn't in CGEventType.
         let mask: CGEventMask = 1 << 29
         let me = Unmanaged.passUnretained(self).toOpaque()
-        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly, eventsOfInterest: mask,
-                                          callback: { _, type, event, info in
+        // At the head of the session, as Pipiri's tap is, which gets the touches of a gesture; it only listens when
+        // macOS refuses a tap there.
+        let callback: CGEventTapCallBack = { _, type, event, info in
                                               if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                                                   if let info { Unmanaged<ThreeFingerTap>.fromOpaque(info).takeUnretainedValue().enable() }
                                               } else if type.rawValue == 29, let info, let copy = event.copy() {
@@ -1580,8 +1583,13 @@ final class ThreeFingerTap: @unchecked Sendable {
                                                   DispatchQueue.main.async { if let ns = NSEvent(cgEvent: copy) { tap.read(ns) } }
                                               }
                                               return Unmanaged.passUnretained(event)
-                                          }, userInfo: me)
+                                          }
+        let filtering = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: mask,
+                                          callback: callback, userInfo: me)
+        guard let tap = filtering ?? CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
+                                                       eventsOfInterest: mask, callback: callback, userInfo: me)
         else { return nil }
+        kind = filtering == nil ? "listening" : "filtering"
         self.tap = tap
         source = CFMachPortCreateRunLoopSource(nil, tap, 0)
         let thread = Thread { [weak self] in
@@ -1608,13 +1616,15 @@ final class ThreeFingerTap: @unchecked Sendable {
 
     deinit { stop() }
 
-    private var seen = 0
+    /// The number of fingers in the last gesture event, for the log, which notes each change.
+    private var fingers = -1
 
     /// On the main thread.
     private func read(_ event: NSEvent) {
-        if seen < 3 {
-            seen += 1
-            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").log("three-finger tap: a gesture with \(event.touches(matching: .any, in: nil).count, privacy: .public) touches")
+        let count = event.touches(matching: .touching, in: nil).count
+        if count != fingers {
+            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").debug("three-finger tap: \(count, privacy: .public) fingers on the trackpad")
+            fingers = count
         }
         // Only trackpad touches have a position; a touch screen's would raise an exception.
         let touches = event.touches(matching: .touching, in: nil).filter { $0.type == .indirect }
@@ -1631,7 +1641,10 @@ final class ThreeFingerTap: @unchecked Sendable {
             return
         }
         guard let start = started else { return }
-        if touches.count < 3, !moved, Date().timeIntervalSince(start) < 0.4 { onTap() }
+        if touches.count < 3, !moved, Date().timeIntervalSince(start) < 0.4 {
+            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").log("three-finger tap")
+            onTap()
+        }
         started = nil
         moved = false
         positions = [:]
