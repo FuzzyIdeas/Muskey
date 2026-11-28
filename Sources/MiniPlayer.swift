@@ -1216,20 +1216,21 @@ final class MiniPlayerPanel: NSPanel {
     /// A three-finger tap fades the player while the pointer is over it, and brings it back.
     private var threeFingerTap: ThreeFingerTap?
 
-    /// Whether the tap was made with Input Monitoring allowed: macOS hands a tap made without it no trackpad events, and
-    /// a tap made before the permission was given stays without them, so it is made again.
+    /// Whether the tap was made with Accessibility allowed. Only then may it filter at the head of the session, which
+    /// is where a gesture event carries every finger; a tap that only listens saw at most two of three. A tap made
+    /// before the permission was given stays a listening one, so it is made again.
     private var tapHasAccess = false
 
     private func watchThreeFingerTap() {
         let wanted = isVisible && Preferences.shared.miniThreeFingerTap
-        let access = CGPreflightListenEventAccess()
+        let access = AXIsProcessTrusted()
         guard wanted != (threeFingerTap != nil) || (wanted && access != tapHasAccess) else { return }
         threeFingerTap?.stop()
         threeFingerTap = nil
         if wanted {
             threeFingerTap = ThreeFingerTap()
             tapHasAccess = access
-            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").log("three-finger tap \(self.threeFingerTap.map { "watched, \($0.kind)" } ?? "not allowed by macOS", privacy: .public), Input Monitoring \(access ? "allowed" : "not allowed", privacy: .public)")
+            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").log("three-finger tap \(self.threeFingerTap.map { "watched, \($0.kind)" } ?? "not allowed by macOS", privacy: .public), Accessibility \(access ? "allowed" : "not allowed", privacy: .public)")
             threeFingerTap?.onTap = { [weak self] in
                 guard let self, isVisible, frame.contains(NSEvent.mouseLocation) else { return }
                 setFaded(!faded)
@@ -1237,7 +1238,7 @@ final class MiniPlayerPanel: NSPanel {
         }
     }
 
-    /// Settings changed the three-finger tap, or Input Monitoring was allowed.
+    /// Settings changed the three-finger tap, or Accessibility was allowed.
     func syncGestures() { watchThreeFingerTap() }
 
     func setFaded(_ on: Bool) {

@@ -2651,7 +2651,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }.store(in: &prefChanges)
         // Published before the change, so the panel takes its new size on the next turn, once the setting reads it.
         prefs.$miniThreeFingerTap.dropFirst().sink { [weak self] _ in DispatchQueue.main.async { self?.miniPanel.syncGestures() } }.store(in: &prefChanges)
-        NotificationCenter.default.publisher(for: .inputMonitoringAllowed).sink { [weak self] _ in self?.miniPanel.syncGestures() }.store(in: &prefChanges)
+        NotificationCenter.default.publisher(for: .accessibilityAllowed).sink { [weak self] _ in self?.miniPanel.syncGestures() }.store(in: &prefChanges)
         prefs.$miniRecordScale.dropFirst().sink { [weak self] scale in
             self?.mini.recordScale = scale
             DispatchQueue.main.async { self?.miniPanel.resize() }

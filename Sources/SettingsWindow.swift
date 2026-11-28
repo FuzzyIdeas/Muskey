@@ -709,7 +709,7 @@ private struct MiniPlayerPane: View {
                 }
                 Toggle("Three-finger tap", isOn: $prefs.miniThreeFingerTap)
                 if prefs.miniThreeFingerTap {
-                    InputMonitoringRow()
+                    AccessibilityRow()
                 }
             }
             Section("Song") {
@@ -735,10 +735,10 @@ private struct MiniPlayerPane: View {
     }
 }
 
-/// The three-finger tap reads the trackpad through an event tap, which macOS feeds only with Input Monitoring allowed.
-/// Until it is, a red pill says so beside Allow, which asks for it and opens its pane in System Settings.
-private struct InputMonitoringRow: View {
-    @State private var allowed = CGPreflightListenEventAccess()
+/// The three-finger tap reads the trackpad through an event tap that sees every finger only with Accessibility
+/// allowed. Until it is, a red pill says so beside Allow, which asks for it and opens its pane in System Settings.
+private struct AccessibilityRow: View {
+    @State private var allowed = AXIsProcessTrusted()
     @Environment(\.colorScheme) private var scheme
     private let check = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -746,14 +746,15 @@ private struct InputMonitoringRow: View {
         if !allowed {
             LabeledContent {
                 Button("Allow") {
-                    if !CGRequestListenEventAccess(),
-                       let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+                    let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+                    if !AXIsProcessTrustedWithOptions(options),
+                       let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
                     {
                         NSWorkspace.shared.open(url)
                     }
                 }
             } label: {
-                Text("Input Monitoring needed")
+                Text("Accessibility needed")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(StripColors.text(.red, scheme))
                     .padding(.horizontal, 8)
@@ -761,16 +762,16 @@ private struct InputMonitoringRow: View {
                     .background(Capsule().fill(StripColors.tint(.red, strong: false, scheme)))
             }
             .onReceive(check) { _ in
-                guard CGPreflightListenEventAccess() else { return }
+                guard AXIsProcessTrusted() else { return }
                 allowed = true
-                NotificationCenter.default.post(name: .inputMonitoringAllowed, object: nil)
+                NotificationCenter.default.post(name: .accessibilityAllowed, object: nil)
             }
         }
     }
 }
 
 extension Notification.Name {
-    static let inputMonitoringAllowed = Notification.Name("inputMonitoringAllowed")
+    static let accessibilityAllowed = Notification.Name("accessibilityAllowed")
 }
 
 /// Settings > General > Menu bar icon: a picture tile for each choice. It takes a binding so renders can show it
