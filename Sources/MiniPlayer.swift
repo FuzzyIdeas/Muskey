@@ -1216,23 +1216,28 @@ final class MiniPlayerPanel: NSPanel {
     /// A three-finger tap fades the player while the pointer is over it, and brings it back.
     private var threeFingerTap: ThreeFingerTap?
 
+    /// Whether the tap was made with Input Monitoring allowed: macOS hands a tap made without it no trackpad events, and
+    /// a tap made before the permission was given stays without them, so it is made again.
+    private var tapHasAccess = false
+
     private func watchThreeFingerTap() {
         let wanted = isVisible && Preferences.shared.miniThreeFingerTap
-        guard wanted != (threeFingerTap != nil) else { return }
+        let access = CGPreflightListenEventAccess()
+        guard wanted != (threeFingerTap != nil) || (wanted && access != tapHasAccess) else { return }
+        threeFingerTap?.stop()
+        threeFingerTap = nil
         if wanted {
             threeFingerTap = ThreeFingerTap()
-            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").log("three-finger tap \(self.threeFingerTap == nil ? "not allowed by macOS" : "watched", privacy: .public)")
+            tapHasAccess = access
+            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").log("three-finger tap \(self.threeFingerTap == nil ? "not allowed by macOS" : "watched", privacy: .public), Input Monitoring \(access ? "allowed" : "not allowed", privacy: .public)")
             threeFingerTap?.onTap = { [weak self] in
                 guard let self, isVisible, frame.contains(NSEvent.mouseLocation) else { return }
                 setFaded(!faded)
             }
-        } else {
-            threeFingerTap?.stop()
-            threeFingerTap = nil
         }
     }
 
-    /// Settings changed the three-finger tap.
+    /// Settings changed the three-finger tap, or Input Monitoring was allowed.
     func syncGestures() { watchThreeFingerTap() }
 
     func setFaded(_ on: Bool) {
@@ -1601,8 +1606,14 @@ final class ThreeFingerTap: @unchecked Sendable {
 
     deinit { stop() }
 
+    private var seen = 0
+
     /// On the tap's thread.
     private func read(_ event: NSEvent) {
+        if seen < 3 {
+            seen += 1
+            Logger(subsystem: LOG_SUBSYSTEM, category: "MiniPlayer").log("three-finger tap: a gesture with \(event.touches(matching: .any, in: nil).count, privacy: .public) touches")
+        }
         // Only trackpad touches have a position; a touch screen's would raise an exception.
         let touches = event.touches(matching: .touching, in: nil).filter { $0.type == .indirect }
         if touches.count == 3 {

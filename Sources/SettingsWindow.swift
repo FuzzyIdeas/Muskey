@@ -708,6 +708,9 @@ private struct MiniPlayerPane: View {
                     Text("Fades the mini player and passes clicks to the windows under it, until the pointer leaves it")
                 }
                 Toggle("Three-finger tap", isOn: $prefs.miniThreeFingerTap)
+                if prefs.miniThreeFingerTap {
+                    InputMonitoringRow()
+                }
             }
             Section("Song") {
                 Toggle("Track", isOn: $prefs.miniLayout.track)
@@ -730,6 +733,44 @@ private struct MiniPlayerPane: View {
         }
         .formStyle(.grouped)
     }
+}
+
+/// The three-finger tap reads the trackpad through an event tap, which macOS feeds only with Input Monitoring allowed.
+/// Until it is, a red pill says so beside Allow, which asks for it and opens its pane in System Settings.
+private struct InputMonitoringRow: View {
+    @State private var allowed = CGPreflightListenEventAccess()
+    @Environment(\.colorScheme) private var scheme
+    private let check = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        if !allowed {
+            LabeledContent {
+                Button("Allow") {
+                    if !CGRequestListenEventAccess(),
+                       let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+                    {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+            } label: {
+                Text("Input Monitoring needed")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(StripColors.text(.red, scheme))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(StripColors.tint(.red, strong: false, scheme)))
+            }
+            .onReceive(check) { _ in
+                guard CGPreflightListenEventAccess() else { return }
+                allowed = true
+                NotificationCenter.default.post(name: .inputMonitoringAllowed, object: nil)
+            }
+        }
+    }
+}
+
+extension Notification.Name {
+    static let inputMonitoringAllowed = Notification.Name("inputMonitoringAllowed")
 }
 
 /// Settings > General > Menu bar icon: a picture tile for each choice. It takes a binding so renders can show it
